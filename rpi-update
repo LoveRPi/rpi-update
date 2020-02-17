@@ -30,10 +30,12 @@ BOOT_PATH=${BOOT_PATH:-"/boot"}
 WORK_PATH=${WORK_PATH:-"${ROOT_PATH}/root"}
 SKIP_KERNEL=${SKIP_KERNEL:-0}
 SKIP_SDK=${SKIP_SDK:-0}
+SKIP_VCLIBS=${SKIP_VCLIBS:-0}
 SKIP_REPODELETE=${SKIP_REPODELETE:-0}
 SKIP_BACKUP=${SKIP_BACKUP:-0}
 SKIP_DOWNLOAD=${SKIP_DOWNLOAD:-0}
 SKIP_WARNING=${SKIP_WARNING:-0}
+SKIP_CHECK_PARTITION=${SKIP_CHECK_PARTITION:-0}
 WANT_SYMVERS=${WANT_SYMVERS:-0}
 WANT_PI4=${WANT_PI4:-0}
 PRUNE_MODULES=${PRUNE_MODULES:-0}
@@ -83,6 +85,12 @@ function update_self() {
 		exit 1
 	fi
 
+	if [[ "$(head -1 ${_tempFileName})" != '#!/bin/bash' ]]; then
+		echo " !!! Failed to download update for rpi-update!"
+		echo " !!! Contents of file is not as expected - github may be down"
+		exit 1
+	fi
+
 	local OCTAL_MODE=$(stat -c '%a' "$0")
 	if ! chmod ${OCTAL_MODE} "${_tempFileName}" ; then
 		echo " !!! Failed: Error while trying to set mode on ${_tempFileName}"
@@ -129,6 +137,10 @@ function update_modules {
 				if [[ "${ENDSWITH}" == "v7l+" ]]; then
 					continue;
 				fi
+				ENDSWITH=${BASEDIR: -3}
+				if [[ "${ENDSWITH}" == "v8+" ]]; then
+					continue;
+				fi
 			fi
 			cp -R "${DIR}" "${FW_MODPATH}/"
 			echo " *** depmod ${BASEDIR}"
@@ -144,7 +156,12 @@ function update_modules {
 }
 
 function update_vc_libs {
-	echo " *** Updating VideoCore libraries"
+	if [[ ${SKIP_VCLIBS} -eq 0 ]]; then
+		echo " *** Updating VideoCore libraries"
+	else
+		echo " *** As requested, not updating VideoCore libraries"
+		return
+	fi
 
 	if [[ -e ${ROOT_PATH}/bin/sh ]]; then
 		local ELFOUTPUT=$(readelf -a "${ROOT_PATH}/bin/sh"; readelf -h "${ROOT_PATH}/bin/sh")
@@ -167,6 +184,67 @@ function update_sdk {
 		cp -R "${FW_REPOLOCAL}/vc/sdk/"* "${ROOT_PATH}/"
 	else
 		echo " *** As requested, not updating SDK"
+	fi
+}
+
+# Check if the bootloader is older than the latest critical release. An old
+# bootloader shouldn't block rpi-update so just inform the user that bootloader
+# is out of date.
+function check_eeprom_version {
+	local CURRENT_VERSION=""
+	local FIRST_VERSION=1557513636
+	# MIN VERSION for Sep 10 2019 EEPROM
+	local MIN_VERSION=1568112110
+	local HAVE_BOOTLOADER_EEPROM=0
+
+	# Skip EEPROM check if vcgencmd is missing because it won't be possible to
+	# check the version.
+	if ! command -v vcgencmd > /dev/null; then
+		return
+	fi
+
+	rev="$(sed -n '/^Revision/s/^.*: \(.*\)/\1/p' < /proc/cpuinfo)"
+	if [ $(((0x$rev >> 23) & 1)) -ne 0 ] && [ $(((0x$rev >> 12) & 15)) -eq 3 ]; then
+		HAVE_BOOTLOADER_EEPROM=1
+	fi
+
+	if [ "${HAVE_BOOTLOADER_EEPROM}" != 1 ]; then
+		return
+	fi
+
+	# vcgencmd doesn't return non-zero for unknown commands.
+	if vcgencmd bootloader_config | grep -qi "Command not registered"; then
+		# Firmware is too old to return the bootloader config
+		return
+	fi
+
+	# If FREEZE_VERSION is specified then assume that the user doesn't want
+	# an EEPROM update so skip the check.
+	if vcgencmd bootloader_config | grep -q FREEZE_VERSION=1; then
+		return
+	fi
+
+	if vcgencmd bootloader_version | grep -q timestamp; then
+		CURRENT_VERSION=$(vcgencmd bootloader_version | grep timestamp | awk '{print $2}')
+		if [ "${CURRENT_VERSION}" = "0" ]; then
+			# If a timestamp of zero is returned then it's new firmware but an
+			# old bootloader. Assume bootloader v0
+			CURRENT_VERSION="${FIRST_VERSION}"
+		fi
+	else
+		# New bootloader / old firmware ? Try to parse the date
+		CURRENT_VERSION=$(date -u +%s --date "$(vcgencmd bootloader_version | head -n1)")
+	fi
+
+	# Failed to parse the version. Default to the initial production release.
+	if [ -z "${CURRENT_VERSION}" ]; then
+		CURRENT_VERSION="${FIRST_VERSION}"
+	fi
+
+	if [ "${CURRENT_VERSION}" -lt "${MIN_VERSION}" ]; then
+		echo "A newer bootloader EEPROM version is available."
+		echo "On Debian, try: sudo apt update; sudo apt install rpi-eeprom"
+		echo "then reboot to install the new bootloader"
 	fi
 }
 
@@ -209,15 +287,19 @@ function show_notice {
 }
 
 function check_partition {
+	if [[ ${SKIP_CHECK_PARTITION} -ne 0 ]]; then
+		return
+	fi
 	local PARTSIZE=0
 	if command -v df > /dev/null 2>&1 ; then
 		local M=$(df -P ${BOOT_PATH} | awk 'END{print $1}')
-		if command -v lsblk > /dev/null 2>&1 ; then
-			PARTSIZE=$(lsblk -bno SIZE ${M})
+		if [[ $M == /dev/* ]]; then
+			if command -v lsblk > /dev/null 2>&1 ; then
+				PARTSIZE=$(lsblk -bno SIZE ${M})
+			fi
 		fi
 	fi
-	echo PARTSIZE:$PARTSIZE
-	if [ $PARTSIZE -lt $(( 256*1024*1024 )) ]; then
+	if [ $PARTSIZE -ne 0 ] && [ $PARTSIZE -lt $(( 256*1024*1024 )) ]; then
 		echo "Partition size $(( $PARTSIZE >> 20 ))M may not be sufficient for new Pi4 files"
 		echo "This could result in a system that will not boot."
 		echo "256M FAT partition is recommended. Ensure you have a backup if continuing."
@@ -321,6 +403,7 @@ function do_update {
 	if [[ ${WANT_PI4} -eq 1 ]]; then
 		check_partition
 	fi
+	check_eeprom_version
 	show_notice
 	download_rev
 	if [[ -f "${FW_REPOLOCAL}/pre-install" ]]; then
